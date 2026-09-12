@@ -20,6 +20,11 @@
 -keep class org.yuzu.yuzu_emu.utils.** { *; }
 -keep class kotlin.Pair { *; }
 
+# SDL3's Android JNI bridge resolves these classes from native code by name.
+# R8 cannot see those JNI-only references, so the bridge must be retained in release builds.
+-keep class org.libsdl.app.** { *; }
+-keep interface org.libsdl.app.** { *; }
+
 # Suppress warnings for R8
 -dontwarn org.bouncycastle.jsse.BCSSLParameters
 -dontwarn org.bouncycastle.jsse.BCSSLSocket
@@ -28,7 +33,7 @@
 -dontwarn org.conscrypt.Conscrypt
 -dontwarn org.conscrypt.ConscryptHostnameVerifier
 -dontwarn org.openjsse.javax.net.ssl.SSLParameters
--dontwarn org.openjsse.javax.net.ssl.SSLSocket
+-dontwarn org.openjsse.net.ssl.SSLSocket
 -dontwarn org.openjsse.net.ssl.OpenJSSE
 -dontwarn java.beans.Introspector
 -dontwarn java.beans.VetoableChangeListener
