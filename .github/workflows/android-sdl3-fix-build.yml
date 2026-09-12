@@ -37,12 +37,51 @@ jobs:
             "cmake;3.31.6" \
             "ndk;28.2.13676358"
           sudo apt-get update
-          sudo apt-get install -y glslang-tools
+          sudo apt-get install -y glslang-tools zstd
 
       - name: Verify native toolchain
         run: |
           "$ANDROID_SDK_ROOT/cmake/3.31.6/bin/cmake" --version
           glslangValidator --version | head -n 3
+
+      - name: Prime SDL3 3.4.8 cache with matching Android Java glue
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDL_CI_VERSION='3.4.8-d57c3b685c'
+          SDL_SOURCE_VERSION='release-3.4.8'
+          SDL_SOURCE_SHA512='df5a323af7ac366661a3c0e887969c72584d232f3cc211419d59b0487b620b6b2859d4549c9e8df002ee489290062e466fcfddf7edc0872a37b1f2845e81c0f3'
+          CACHE="$GITHUB_WORKSPACE/.cache/cpm/sdl3/${SDL_CI_VERSION}-android-aarch64"
+          CI_TARBALL="$RUNNER_TEMP/SDL3-android-aarch64-${SDL_CI_VERSION}.tar.zst"
+          SOURCE_TARBALL="$RUNNER_TEMP/SDL-${SDL_SOURCE_VERSION}.tar.gz"
+          SOURCE_DIR="$RUNNER_TEMP/SDL-${SDL_SOURCE_VERSION}"
+
+          rm -rf "$CACHE" "$SOURCE_DIR"
+          mkdir -p "$CACHE" "$SOURCE_DIR"
+
+          CI_URL="https://github.com/crueter-ci/SDL3/releases/download/v${SDL_CI_VERSION}/SDL3-android-aarch64-${SDL_CI_VERSION}.tar.zst"
+          CI_SHA_URL="${CI_URL}.sha512sum"
+          curl --fail --location --retry 5 --retry-all-errors "$CI_URL" --output "$CI_TARBALL"
+          CI_SHA512="$(curl --fail --location --retry 5 --retry-all-errors "$CI_SHA_URL" | tr -d '[:space:]')"
+          echo "${CI_SHA512}  ${CI_TARBALL}" | sha512sum --check --status
+          tar --zstd -xf "$CI_TARBALL" -C "$CACHE"
+
+          SOURCE_URL="https://github.com/libsdl-org/SDL/archive/${SDL_SOURCE_VERSION}.tar.gz"
+          curl --fail --location --retry 5 --retry-all-errors "$SOURCE_URL" --output "$SOURCE_TARBALL"
+          echo "${SDL_SOURCE_SHA512}  ${SOURCE_TARBALL}" | sha512sum --check --status
+          tar -xzf "$SOURCE_TARBALL" -C "$SOURCE_DIR" --strip-components=1
+
+          mkdir -p "$CACHE/java"
+          cp -R "$SOURCE_DIR/android-project/app/src/main/java/." "$CACHE/java/"
+
+          # CPMUtil's no-patch cache key is the literal string "none".
+          printf 'none' > "$CACHE/.cpm_patch_key"
+
+          test -f "$CACHE/CMakeLists.txt"
+          test -f "$CACHE/java/org/libsdl/app/SDLActivity.java"
+          grep -Fq 'SDL_MICRO_VERSION = 8' "$CACHE/java/org/libsdl/app/SDLActivity.java"
+          echo "Prepared SDL3 native cache and exact 3.4.8 Android Java glue at $CACHE"
 
       - name: Build mainline release APK
         working-directory: src/android
