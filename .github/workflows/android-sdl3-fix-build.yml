@@ -37,9 +37,35 @@ jobs:
 
       - name: Build mainline release APK
         working-directory: src/android
+        shell: bash
         env:
           GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx6g
-        run: ./gradlew :app:assembleMainlineRelease --stacktrace --no-daemon
+        run: |
+          set +e
+          ./gradlew :app:assembleMainlineRelease --stacktrace --no-daemon 2>&1 | tee "$RUNNER_TEMP/gradle-mainline-release.log"
+          GRADLE_RC=${PIPESTATUS[0]}
+          set -e
+
+          echo "gradlew exit code: $GRADLE_RC"
+          APK="$(find app/build/outputs/apk -type f -name '*.apk' | head -n 1 || true)"
+
+          if [ "$GRADLE_RC" -ne 0 ]; then
+            if grep -Fq 'BUILD SUCCESSFUL' "$RUNNER_TEMP/gradle-mainline-release.log" && [ -n "$APK" ] && [ -f "$APK" ]; then
+              echo "::warning::Gradle returned $GRADLE_RC after BUILD SUCCESSFUL; APK exists at $APK, continuing to independent APK/DEX validation."
+            else
+              echo "::error::Gradle returned $GRADLE_RC without both BUILD SUCCESSFUL and a produced APK."
+              exit "$GRADLE_RC"
+            fi
+          fi
+
+      - name: Upload Gradle diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-mainline-release-log
+          path: ${{ runner.temp }}/gradle-mainline-release.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Locate APK
         id: apk
