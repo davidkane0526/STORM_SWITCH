@@ -34,25 +34,7 @@ jobs:
 
       - name: Make CPMUtil compatible with Android CMake 3.22
         shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('CMakeModules/CPMUtil.cmake')
-          text = path.read_text()
-          old = '''    set(${ARG_URL_OUT} "${url}")
-
-    return(PROPAGATE ${ARG_URL_OUT} ${ARG_GIT_URL_OUT})
-'''
-          new = '''    set(${ARG_URL_OUT} "${url}" PARENT_SCOPE)
-    if (DEFINED ARG_GIT_URL_OUT)
-        set(${ARG_GIT_URL_OUT} "${${ARG_GIT_URL_OUT}}" PARENT_SCOPE)
-    endif()
-    return()
-'''
-          if old not in text:
-              raise SystemExit('Expected get_package_url return block not found')
-          path.write_text(text.replace(old, new, 1))
-          PY
+        run: python3 -c 'from pathlib import Path; p=Path("CMakeModules/CPMUtil.cmake"); s=p.read_text(); old="    set(${ARG_URL_OUT} \"${url}\")\n\n    return(PROPAGATE ${ARG_URL_OUT} ${ARG_GIT_URL_OUT})\n"; new="    set(${ARG_URL_OUT} \"${url}\" PARENT_SCOPE)\n    if (DEFINED ARG_GIT_URL_OUT)\n        set(${ARG_GIT_URL_OUT} \"${${ARG_GIT_URL_OUT}}\" PARENT_SCOPE)\n    endif()\n    return()\n"; assert old in s, "expected get_package_url return block not found"; p.write_text(s.replace(old,new,1))'
 
       - name: Build mainline release APK
         working-directory: src/android
