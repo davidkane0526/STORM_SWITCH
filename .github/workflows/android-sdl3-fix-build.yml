@@ -32,6 +32,28 @@ jobs:
       - name: Install Android 36 SDK
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
+      - name: Make CPMUtil compatible with Android CMake 3.22
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('CMakeModules/CPMUtil.cmake')
+          text = path.read_text()
+          old = '''    set(${ARG_URL_OUT} "${url}")
+
+    return(PROPAGATE ${ARG_URL_OUT} ${ARG_GIT_URL_OUT})
+'''
+          new = '''    set(${ARG_URL_OUT} "${url}" PARENT_SCOPE)
+    if (DEFINED ARG_GIT_URL_OUT)
+        set(${ARG_GIT_URL_OUT} "${${ARG_GIT_URL_OUT}}" PARENT_SCOPE)
+    endif()
+    return()
+'''
+          if old not in text:
+              raise SystemExit('Expected get_package_url return block not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+
       - name: Build mainline release APK
         working-directory: src/android
         env:
