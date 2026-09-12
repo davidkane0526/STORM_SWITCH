@@ -44,18 +44,20 @@ jobs:
           "$ANDROID_SDK_ROOT/cmake/3.31.6/bin/cmake" --version
           glslangValidator --version | head -n 3
 
-      - name: Prime SDL3 3.4.8 cache with matching Android Java glue
+      - name: Prepare matching SDL3 Android JNI bridge
         shell: bash
         run: |
           set -euo pipefail
 
           SDL_CI_VERSION='3.4.8-d57c3b685c'
-          SDL_SOURCE_VERSION='release-3.4.8'
-          SDL_SOURCE_SHA512='df5a323af7ac366661a3c0e887969c72584d232f3cc211419d59b0487b620b6b2859d4549c9e8df002ee489290062e466fcfddf7edc0872a37b1f2845e81c0f3'
+          SDL_SOURCE_COMMIT='d57c3b685c434d2ee0fa3d258f7e165b6e8d0cf6'
           CACHE="$GITHUB_WORKSPACE/.cache/cpm/sdl3/${SDL_CI_VERSION}-android-aarch64"
           CI_TARBALL="$RUNNER_TEMP/SDL3-android-aarch64-${SDL_CI_VERSION}.tar.zst"
-          SOURCE_TARBALL="$RUNNER_TEMP/SDL-${SDL_SOURCE_VERSION}.tar.gz"
-          SOURCE_DIR="$RUNNER_TEMP/SDL-${SDL_SOURCE_VERSION}"
+          SOURCE_TARBALL="$RUNNER_TEMP/SDL-${SDL_SOURCE_COMMIT}.tar.gz"
+          SOURCE_DIR="$RUNNER_TEMP/SDL-${SDL_SOURCE_COMMIT}"
+          NDK_BIN="$ANDROID_SDK_ROOT/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          NM="$NDK_BIN/llvm-nm"
+          OBJCOPY="$NDK_BIN/llvm-objcopy"
 
           rm -rf "$CACHE" "$SOURCE_DIR"
           mkdir -p "$CACHE" "$SOURCE_DIR"
@@ -67,9 +69,26 @@ jobs:
           echo "${CI_SHA512}  ${CI_TARBALL}" | sha512sum --check --status
           tar --zstd -xf "$CI_TARBALL" -C "$CACHE"
 
-          SOURCE_URL="https://github.com/libsdl-org/SDL/archive/${SDL_SOURCE_VERSION}.tar.gz"
+          SDL_ARCHIVE="$CACHE/lib/libSDL3.a"
+          test -f "$SDL_ARCHIVE"
+          echo 'SDL JNI symbols before rename:'
+          "$NM" -g --defined-only "$SDL_ARCHIVE" | grep -E '(^|[[:space:]])(JNI_OnLoad|SDL_JNI_OnLoad)$' || true
+
+          if "$NM" -g --defined-only "$SDL_ARCHIVE" | grep -Eq '(^|[[:space:]])SDL_JNI_OnLoad$'; then
+            echo 'SDL_JNI_OnLoad already exported; no rename needed.'
+          elif "$NM" -g --defined-only "$SDL_ARCHIVE" | grep -Eq '(^|[[:space:]])JNI_OnLoad$'; then
+            "$OBJCOPY" --redefine-sym JNI_OnLoad=SDL_JNI_OnLoad "$SDL_ARCHIVE"
+          else
+            echo '::error::SDL static archive exports neither JNI_OnLoad nor SDL_JNI_OnLoad.'
+            exit 1
+          fi
+
+          echo 'SDL JNI symbols after rename:'
+          "$NM" -g --defined-only "$SDL_ARCHIVE" | grep -E '(^|[[:space:]])(JNI_OnLoad|SDL_JNI_OnLoad)$' || true
+          "$NM" -g --defined-only "$SDL_ARCHIVE" | grep -Eq '(^|[[:space:]])SDL_JNI_OnLoad$'
+
+          SOURCE_URL="https://github.com/libsdl-org/SDL/archive/${SDL_SOURCE_COMMIT}.tar.gz"
           curl --fail --location --retry 5 --retry-all-errors "$SOURCE_URL" --output "$SOURCE_TARBALL"
-          echo "${SDL_SOURCE_SHA512}  ${SOURCE_TARBALL}" | sha512sum --check --status
           tar -xzf "$SOURCE_TARBALL" -C "$SOURCE_DIR" --strip-components=1
 
           mkdir -p "$CACHE/java"
@@ -80,8 +99,7 @@ jobs:
 
           test -f "$CACHE/CMakeLists.txt"
           test -f "$CACHE/java/org/libsdl/app/SDLActivity.java"
-          grep -Fq 'SDL_MICRO_VERSION = 8' "$CACHE/java/org/libsdl/app/SDLActivity.java"
-          echo "Prepared SDL3 native cache and exact 3.4.8 Android Java glue at $CACHE"
+          echo "Prepared exact SDL ${SDL_SOURCE_COMMIT} Java glue and renamed static JNI entrypoint at $CACHE"
 
       - name: Build mainline release APK
         working-directory: src/android
