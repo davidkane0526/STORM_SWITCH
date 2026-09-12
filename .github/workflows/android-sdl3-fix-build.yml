@@ -33,8 +33,7 @@ jobs:
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
       - name: Make CPMUtil compatible with Android CMake 3.22
-        shell: bash
-        run: python3 -c 'from pathlib import Path; p=Path("CMakeModules/CPMUtil.cmake"); s=p.read_text(); old="    set(${ARG_URL_OUT} \"${url}\")\n\n    return(PROPAGATE ${ARG_URL_OUT} ${ARG_GIT_URL_OUT})\n"; new="    set(${ARG_URL_OUT} \"${url}\" PARENT_SCOPE)\n    if (DEFINED ARG_GIT_URL_OUT)\n        set(${ARG_GIT_URL_OUT} \"${${ARG_GIT_URL_OUT}}\" PARENT_SCOPE)\n    endif()\n    return()\n"; assert old in s, "expected get_package_url return block not found"; p.write_text(s.replace(old,new,1))'
+        run: python3 .github/scripts/cmake322_compat.py
 
       - name: Build mainline release APK
         working-directory: src/android
