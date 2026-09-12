@@ -1,0 +1,76 @@
+name: Android SDL3 startup fix build
+
+on:
+  push:
+    branches:
+      - fix/android-sdl3-startup-8.1.2
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: src/android/**/*.gradle*
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android 36 SDK
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Build mainline release APK
+        working-directory: src/android
+        env:
+          GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx6g
+        run: ./gradlew :app:assembleMainlineRelease --stacktrace --no-daemon
+
+      - name: Locate APK
+        id: apk
+        shell: bash
+        run: |
+          APK="$(find src/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          if [ -z "$APK" ]; then
+            echo "::error::No APK produced"
+            exit 1
+          fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "APK: $APK"
+
+      - name: Verify SDLActivity is packaged
+        shell: bash
+        run: |
+          APK='${{ steps.apk.outputs.path }}'
+          FOUND=0
+          while IFS= read -r DEX; do
+            if unzip -p "$APK" "$DEX" | strings | grep -Fq 'org/libsdl/app/SDLActivity'; then
+              echo "Found org.libsdl.app.SDLActivity in $DEX"
+              FOUND=1
+              break
+            fi
+          done < <(unzip -Z1 "$APK" | grep -E '^classes([0-9]+)?\.dex$')
+          if [ "$FOUND" -ne 1 ]; then
+            echo "::error::org.libsdl.app.SDLActivity is missing from the built APK"
+            exit 1
+          fi
+
+      - name: Upload fixed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: STORM_SWITCH_8.1.2_SDL3_FIX
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
