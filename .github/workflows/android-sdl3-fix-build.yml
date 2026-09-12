@@ -70,22 +70,36 @@ jobs:
           tar --zstd -xf "$CI_TARBALL" -C "$CACHE"
 
           SDL_ARCHIVE="$CACHE/lib/libSDL3.a"
+          SYMBOLS_BEFORE="$RUNNER_TEMP/sdl3-symbols-before.txt"
+          SYMBOLS_AFTER="$RUNNER_TEMP/sdl3-symbols-after.txt"
+          PATCHED_ARCHIVE="$RUNNER_TEMP/libSDL3.patched.a"
           test -f "$SDL_ARCHIVE"
-          echo 'SDL JNI symbols before rename:'
-          "$NM" -g --defined-only "$SDL_ARCHIVE" | grep -E '(^|[[:space:]])(JNI_OnLoad|SDL_JNI_OnLoad)$' || true
 
-          if "$NM" -g --defined-only "$SDL_ARCHIVE" | grep -Eq '(^|[[:space:]])SDL_JNI_OnLoad$'; then
+          "$NM" -g --defined-only "$SDL_ARCHIVE" > "$SYMBOLS_BEFORE"
+          echo 'SDL JNI symbols before rename:'
+          grep -E '(^|[[:space:]])(JNI_OnLoad|SDL_JNI_OnLoad)$' "$SYMBOLS_BEFORE" || true
+
+          if grep -Fq ' SDL_JNI_OnLoad' "$SYMBOLS_BEFORE"; then
             echo 'SDL_JNI_OnLoad already exported; no rename needed.'
-          elif "$NM" -g --defined-only "$SDL_ARCHIVE" | grep -Eq '(^|[[:space:]])JNI_OnLoad$'; then
-            "$OBJCOPY" --redefine-sym JNI_OnLoad=SDL_JNI_OnLoad "$SDL_ARCHIVE"
+          elif grep -Fq ' JNI_OnLoad' "$SYMBOLS_BEFORE"; then
+            "$OBJCOPY" --redefine-sym JNI_OnLoad=SDL_JNI_OnLoad "$SDL_ARCHIVE" "$PATCHED_ARCHIVE"
+            mv "$PATCHED_ARCHIVE" "$SDL_ARCHIVE"
           else
             echo '::error::SDL static archive exports neither JNI_OnLoad nor SDL_JNI_OnLoad.'
             exit 1
           fi
 
+          "$NM" -g --defined-only "$SDL_ARCHIVE" > "$SYMBOLS_AFTER"
           echo 'SDL JNI symbols after rename:'
-          "$NM" -g --defined-only "$SDL_ARCHIVE" | grep -E '(^|[[:space:]])(JNI_OnLoad|SDL_JNI_OnLoad)$' || true
-          "$NM" -g --defined-only "$SDL_ARCHIVE" | grep -Eq '(^|[[:space:]])SDL_JNI_OnLoad$'
+          grep -E '(^|[[:space:]])(JNI_OnLoad|SDL_JNI_OnLoad)$' "$SYMBOLS_AFTER" || true
+          if ! grep -Fq ' SDL_JNI_OnLoad' "$SYMBOLS_AFTER"; then
+            echo '::error::SDL_JNI_OnLoad was not produced by the archive rewrite.'
+            exit 1
+          fi
+          if grep -Fq ' JNI_OnLoad' "$SYMBOLS_AFTER"; then
+            echo '::error::Original SDL JNI_OnLoad is still exported after the archive rewrite.'
+            exit 1
+          fi
 
           SOURCE_URL="https://github.com/libsdl-org/SDL/archive/${SDL_SOURCE_COMMIT}.tar.gz"
           curl --fail --location --retry 5 --retry-all-errors "$SOURCE_URL" --output "$SOURCE_TARBALL"
