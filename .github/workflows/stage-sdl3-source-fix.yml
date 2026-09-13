@@ -1,0 +1,199 @@
+name: Stage deterministic SDL3 source fix
+
+on:
+  push:
+    branches:
+      - fix/android-sdl3-startup-8.1.2
+    paths:
+      - .github/workflows/stage-sdl3-source-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  stage:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: fix/android-sdl3-startup-8.1.2
+          fetch-depth: 0
+
+      - name: Vendor exact SDL3 Android Java bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.request import urlopen
+          import hashlib
+
+          commit = "d57c3b685c434d2ee0fa3d258f7e165b6e8d0cf6"
+          blobs = {
+              "HIDDevice.java": "f96095324b85858ab7e43fd5a0bab232f413eefe",
+              "HIDDeviceBLESteamController.java": "e14a11bad1b3efc63f76191348642ca9dde478d9",
+              "HIDDeviceManager.java": "b00c905df6f633a9047cd45a07276bb887b4d82c",
+              "HIDDeviceUSB.java": "8ec1cd1bc825cc1099755cca6a39c4cd7394d3c8",
+              "SDL.java": "d9650a72e4230ef666a4ff3a5b5cedb58413adc3",
+              "SDLActivity.java": "9df90cd4468502d0e10fa337dfb3e10758f72ab8",
+              "SDLAudioManager.java": "43706fa409811036312a0e9d865e8c93844440fd",
+              "SDLControllerManager.java": "2a0296eb0c03fe76066af716f41595d851874d67",
+              "SDLDummyEdit.java": "61d8fe8508214881653de177df377b3da05ddb6f",
+              "SDLInputConnection.java": "fdc2994c151ab1cb5cac664fac9d3f89aee83dbc",
+              "SDLSurface.java": "dedc00b78a8c0e286cd90f2c0411d1b239bac3b3",
+          }
+          root = Path("externals/generated/sdl/java/org/libsdl/app")
+          root.mkdir(parents=True, exist_ok=True)
+
+          def blob_sha(data: bytes) -> str:
+              header = f"blob {len(data)}\0".encode()
+              return hashlib.sha1(header + data).hexdigest()
+
+          for name, expected in blobs.items():
+              url = f"https://raw.githubusercontent.com/libsdl-org/SDL/{commit}/android-project/app/src/main/java/org/libsdl/app/{name}"
+              data = urlopen(url, timeout=30).read()
+              actual = blob_sha(data)
+              if actual != expected:
+                  raise SystemExit(f"blob mismatch for {name}: expected {expected}, got {actual}")
+              (root / name).write_bytes(data)
+
+          meta = Path("externals/generated/sdl/UPSTREAM.md")
+          meta.write_text(
+              "# SDL3 Android Java bridge\n\n"
+              f"Vendored from `libsdl-org/SDL` commit `{commit}`.\n\n"
+              "This exact commit matches the Android native SDL package used by STORM SWITCH 8.1.2. "
+              "Do not update these Java sources independently from the native SDL package.\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Add native JNI bridge hook
+        shell: bash
+        run: |
+          cat > CMakeModules/AndroidSDL3Bridge.cmake <<'EOF'
+          # SPDX-License-Identifier: GPL-3.0-or-later
+          # Keep SDL's Android JNI loader distinct from STORM's JNI_OnLoad.
+
+          function(storm_prepare_sdl3_android_native_bridge)
+              if (NOT ANDROID)
+                  return()
+              endif()
+
+              if (NOT TARGET SDL3)
+                  message(FATAL_ERROR "Bundled SDL3 target is unavailable")
+              endif()
+
+              get_target_property(_sdl3_archive SDL3 IMPORTED_LOCATION)
+              if (NOT _sdl3_archive OR NOT EXISTS "${_sdl3_archive}")
+                  message(FATAL_ERROR "Bundled SDL3 static archive was not found: ${_sdl3_archive}")
+              endif()
+
+              set(_sdl3_nm "${CMAKE_NM}")
+              if (NOT _sdl3_nm OR NOT EXISTS "${_sdl3_nm}")
+                  find_program(_sdl3_nm NAMES llvm-nm nm)
+              endif()
+              if (NOT _sdl3_nm)
+                  message(FATAL_ERROR "Unable to locate nm for SDL3 JNI validation")
+              endif()
+
+              set(_sdl3_objcopy "${CMAKE_OBJCOPY}")
+              if (NOT _sdl3_objcopy OR NOT EXISTS "${_sdl3_objcopy}")
+                  find_program(_sdl3_objcopy NAMES llvm-objcopy objcopy)
+              endif()
+              if (NOT _sdl3_objcopy)
+                  message(FATAL_ERROR "Unable to locate objcopy for SDL3 JNI rewrite")
+              endif()
+
+              execute_process(
+                  COMMAND "${_sdl3_nm}" -g --defined-only "${_sdl3_archive}"
+                  RESULT_VARIABLE _sdl3_nm_result
+                  OUTPUT_VARIABLE _sdl3_symbols_before
+                  ERROR_VARIABLE _sdl3_nm_error
+              )
+              if (NOT _sdl3_nm_result EQUAL 0)
+                  message(FATAL_ERROR "Failed to inspect SDL3 archive: ${_sdl3_nm_error}")
+              endif()
+
+              string(FIND "${_sdl3_symbols_before}" " SDL_JNI_OnLoad" _sdl3_prefixed_index)
+              string(FIND "${_sdl3_symbols_before}" " JNI_OnLoad" _sdl3_plain_index)
+
+              if (NOT _sdl3_prefixed_index EQUAL -1)
+                  if (NOT _sdl3_plain_index EQUAL -1)
+                      message(FATAL_ERROR "SDL3 archive exports both JNI_OnLoad and SDL_JNI_OnLoad")
+                  endif()
+                  message(STATUS "SDL3 Android JNI entrypoint is already namespaced")
+                  return()
+              endif()
+
+              if (_sdl3_plain_index EQUAL -1)
+                  message(FATAL_ERROR "SDL3 archive exports neither JNI_OnLoad nor SDL_JNI_OnLoad")
+              endif()
+
+              set(_sdl3_rewrite_dir "${CMAKE_BINARY_DIR}/generated/sdl3")
+              set(_sdl3_rewrite_input "${_sdl3_rewrite_dir}/libSDL3.input.a")
+              set(_sdl3_rewrite_output "${_sdl3_rewrite_dir}/libSDL3.storm.a")
+              file(MAKE_DIRECTORY "${_sdl3_rewrite_dir}")
+              file(COPY_FILE "${_sdl3_archive}" "${_sdl3_rewrite_input}" ONLY_IF_DIFFERENT)
+              file(REMOVE "${_sdl3_rewrite_output}")
+
+              execute_process(
+                  COMMAND "${_sdl3_objcopy}"
+                      --redefine-sym JNI_OnLoad=SDL_JNI_OnLoad
+                      "${_sdl3_rewrite_input}"
+                      "${_sdl3_rewrite_output}"
+                  RESULT_VARIABLE _sdl3_objcopy_result
+                  ERROR_VARIABLE _sdl3_objcopy_error
+              )
+              if (NOT _sdl3_objcopy_result EQUAL 0)
+                  message(FATAL_ERROR "Failed to rewrite SDL3 JNI entrypoint: ${_sdl3_objcopy_error}")
+              endif()
+
+              execute_process(
+                  COMMAND "${_sdl3_nm}" -g --defined-only "${_sdl3_rewrite_output}"
+                  RESULT_VARIABLE _sdl3_verify_result
+                  OUTPUT_VARIABLE _sdl3_symbols_after
+                  ERROR_VARIABLE _sdl3_verify_error
+              )
+              if (NOT _sdl3_verify_result EQUAL 0)
+                  message(FATAL_ERROR "Failed to verify rewritten SDL3 archive: ${_sdl3_verify_error}")
+              endif()
+
+              string(FIND "${_sdl3_symbols_after}" " SDL_JNI_OnLoad" _sdl3_after_prefixed)
+              string(FIND "${_sdl3_symbols_after}" " JNI_OnLoad" _sdl3_after_plain)
+              if (_sdl3_after_prefixed EQUAL -1 OR NOT _sdl3_after_plain EQUAL -1)
+                  message(FATAL_ERROR "SDL3 JNI entrypoint rewrite verification failed")
+              endif()
+
+              set_property(TARGET SDL3 PROPERTY IMPORTED_LOCATION "${_sdl3_rewrite_output}")
+              message(STATUS "Rewrote SDL3 Android JNI entrypoint: JNI_OnLoad -> SDL_JNI_OnLoad")
+          endfunction()
+
+          cmake_language(DEFER CALL storm_prepare_sdl3_android_native_bridge)
+          EOF
+
+      - name: Wire CMake hook into Android build
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src/android/app/build.gradle.kts")
+          text = path.read_text(encoding="utf-8")
+          old = '                        "-DYUZU_DOWNLOAD_ANDROID_VVL=OFF",\n'
+          new = old + '                        "-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=${edenDir}/CMakeModules/AndroidSDL3Bridge.cmake",\n'
+          if text.count(old) != 1:
+              raise SystemExit("expected exactly one Android VVL argument anchor")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+          git diff --check
+
+      - name: Commit source fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Davidkane'
+          git config user.email '23145087+davidkane0526@users.noreply.github.com'
+          git add CMakeModules/AndroidSDL3Bridge.cmake src/android/app/build.gradle.kts externals/generated/sdl/UPSTREAM.md
+          git add -f externals/generated/sdl/java
+          git commit -m 'android: make SDL3 JNI bridge self-contained'
+          git push origin HEAD:fix/android-sdl3-startup-8.1.2
