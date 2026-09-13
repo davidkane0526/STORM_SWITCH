@@ -1,0 +1,208 @@
+name: TOTK black-box flush-only experiment
+
+on:
+  push:
+    branches:
+      - experiment/totk-blackbox-flush-only
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Apply TOTK flush-only experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          TOTK = "0x0100F2C0115B6000ULL"
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8-sig")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, got {count}")
+              text = text.replace(old, new, 1)
+              p.write_text(text, encoding="utf-8")
+
+          # Do not apply STORM's bundled TOTK profile. This removes High GPU accuracy,
+          # reactive flushing, Fast GPU Time off, memory-layout overrides, etc.
+          replace_once(
+              "src/core/core.cpp",
+              "Core::GameFixDatabase::ApplyProfileDirectly(params.program_id);",
+              f"if (params.program_id != {TOTK}) {{\n                Core::GameFixDatabase::ApplyProfileDirectly(params.program_id);\n            }}",
+          )
+
+          # Force all ordinary High-accuracy gates back to the Normal fast path for TOTK.
+          replace_once(
+              "src/common/settings.cpp",
+              "bool IsGPULevelHigh() {\n    return values.current_gpu_accuracy == GpuAccuracy::High;\n}",
+              f"bool IsGPULevelHigh() {{\n    if (GetCurrentProgramID() == {TOTK}) {{\n        return false;\n    }}\n    return values.current_gpu_accuracy == GpuAccuracy::High;\n}}",
+          )
+
+          # Keep only High's flush-before-invalidate behavior for TOTK.
+          replace_once(
+              "src/video_core/gpu_thread.cpp",
+              "void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async) {\n    if (Settings::IsGPULevelHigh()) {",
+              f"void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async) {{\n    const bool totk_flush_workaround = Settings::GetCurrentProgramID() == {TOTK};\n    if (Settings::IsGPULevelHigh() || totk_flush_workaround) {{",
+          )
+
+          replace_once(
+              "src/video_core/renderer_vulkan/vk_rasterizer.cpp",
+              "void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,\n                                                VideoCommon::CacheType which) {\n    if (Settings::IsGPULevelHigh()) {",
+              f"void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,\n                                                VideoCommon::CacheType which) {{\n    const bool totk_flush_workaround = Settings::GetCurrentProgramID() == {TOTK};\n    if (Settings::IsGPULevelHigh() || totk_flush_workaround) {{",
+          )
+          PY
+
+          git diff --check
+          git diff -- src/core/core.cpp src/common/settings.cpp src/video_core/gpu_thread.cpp src/video_core/renderer_vulkan/vk_rasterizer.cpp
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: src/android/**/*.gradle*
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build toolchain
+        run: |
+          sdkmanager \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "cmake;3.31.6" \
+            "ndk;28.2.13676358"
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools zstd
+
+      - name: Prepare matching SDL3 Android JNI bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDL_CI_VERSION='3.4.8-d57c3b685c'
+          SDL_SOURCE_COMMIT='d57c3b685c434d2ee0fa3d258f7e165b6e8d0cf6'
+          CACHE="$GITHUB_WORKSPACE/.cache/cpm/sdl3/${SDL_CI_VERSION}-android-aarch64"
+          CI_TARBALL="$RUNNER_TEMP/SDL3-android-aarch64-${SDL_CI_VERSION}.tar.zst"
+          SOURCE_TARBALL="$RUNNER_TEMP/SDL-${SDL_SOURCE_COMMIT}.tar.gz"
+          SOURCE_DIR="$RUNNER_TEMP/SDL-${SDL_SOURCE_COMMIT}"
+          NDK_BIN="$ANDROID_SDK_ROOT/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          NM="$NDK_BIN/llvm-nm"
+          OBJCOPY="$NDK_BIN/llvm-objcopy"
+
+          rm -rf "$CACHE" "$SOURCE_DIR"
+          mkdir -p "$CACHE" "$SOURCE_DIR"
+
+          CI_URL="https://github.com/crueter-ci/SDL3/releases/download/v${SDL_CI_VERSION}/SDL3-android-aarch64-${SDL_CI_VERSION}.tar.zst"
+          CI_SHA_URL="${CI_URL}.sha512sum"
+          curl --fail --location --retry 5 --retry-all-errors "$CI_URL" --output "$CI_TARBALL"
+          CI_SHA512="$(curl --fail --location --retry 5 --retry-all-errors "$CI_SHA_URL" | tr -d '[:space:]')"
+          echo "${CI_SHA512}  ${CI_TARBALL}" | sha512sum --check --status
+          tar --zstd -xf "$CI_TARBALL" -C "$CACHE"
+
+          SDL_ARCHIVE="$CACHE/lib/libSDL3.a"
+          SYMBOLS_BEFORE="$RUNNER_TEMP/sdl3-symbols-before.txt"
+          SYMBOLS_AFTER="$RUNNER_TEMP/sdl3-symbols-after.txt"
+          PATCHED_ARCHIVE="$RUNNER_TEMP/libSDL3.patched.a"
+          test -f "$SDL_ARCHIVE"
+
+          "$NM" -g --defined-only "$SDL_ARCHIVE" > "$SYMBOLS_BEFORE"
+          if grep -Fq ' SDL_JNI_OnLoad' "$SYMBOLS_BEFORE"; then
+            true
+          elif grep -Fq ' JNI_OnLoad' "$SYMBOLS_BEFORE"; then
+            "$OBJCOPY" --redefine-sym JNI_OnLoad=SDL_JNI_OnLoad "$SDL_ARCHIVE" "$PATCHED_ARCHIVE"
+            mv "$PATCHED_ARCHIVE" "$SDL_ARCHIVE"
+          else
+            echo '::error::SDL static archive exports neither JNI_OnLoad nor SDL_JNI_OnLoad.'
+            exit 1
+          fi
+
+          "$NM" -g --defined-only "$SDL_ARCHIVE" > "$SYMBOLS_AFTER"
+          grep -Fq ' SDL_JNI_OnLoad' "$SYMBOLS_AFTER"
+          ! grep -Fq ' JNI_OnLoad' "$SYMBOLS_AFTER"
+
+          SOURCE_URL="https://github.com/libsdl-org/SDL/archive/${SDL_SOURCE_COMMIT}.tar.gz"
+          curl --fail --location --retry 5 --retry-all-errors "$SOURCE_URL" --output "$SOURCE_TARBALL"
+          tar -xzf "$SOURCE_TARBALL" -C "$SOURCE_DIR" --strip-components=1
+          mkdir -p "$CACHE/java"
+          cp -R "$SOURCE_DIR/android-project/app/src/main/java/." "$CACHE/java/"
+          printf 'none' > "$CACHE/.cpm_patch_key"
+          test -f "$CACHE/java/org/libsdl/app/SDLActivity.java"
+
+      - name: Build mainline release APK
+        working-directory: src/android
+        shell: bash
+        env:
+          GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx6g
+        run: |
+          set +e
+          ./gradlew :app:assembleMainlineRelease --stacktrace --no-daemon 2>&1 | tee "$RUNNER_TEMP/gradle-mainline-release.log"
+          GRADLE_RC=${PIPESTATUS[0]}
+          set -e
+          APK="$(find app/build/outputs/apk -type f -name '*.apk' | head -n 1 || true)"
+          if [ "$GRADLE_RC" -ne 0 ]; then
+            if grep -Fq 'BUILD SUCCESSFUL' "$RUNNER_TEMP/gradle-mainline-release.log" && [ -n "$APK" ] && [ -f "$APK" ]; then
+              echo "::warning::Gradle returned $GRADLE_RC after BUILD SUCCESSFUL; continuing validation."
+            else
+              exit "$GRADLE_RC"
+            fi
+          fi
+
+      - name: Upload Gradle diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: totk-flush-only-gradle-log
+          path: ${{ runner.temp }}/gradle-mainline-release.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Locate APK
+        id: apk
+        shell: bash
+        run: |
+          APK="$(find src/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Verify SDLActivity and native JNI symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK='${{ steps.apk.outputs.path }}'
+          FOUND=0
+          while IFS= read -r DEX; do
+            if unzip -p "$APK" "$DEX" | strings | grep -Fq 'org/libsdl/app/SDLActivity'; then
+              FOUND=1
+              break
+            fi
+          done < <(unzip -Z1 "$APK" | grep -E '^classes([0-9]+)?\.dex$')
+          test "$FOUND" -eq 1
+
+          TMP="$RUNNER_TEMP/native-check"
+          mkdir -p "$TMP"
+          unzip -p "$APK" 'lib/arm64-v8a/libyuzu-android.so' > "$TMP/libyuzu-android.so"
+          readelf -Ws "$TMP/libyuzu-android.so" | grep -F 'SDL_JNI_OnLoad'
+          readelf -Ws "$TMP/libyuzu-android.so" | grep -F 'JNI_OnLoad'
+
+      - name: Upload TOTK flush-only APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: STORM_SWITCH_8.1.2_TOTK_BLACKBOX_FLUSH_ONLY
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
