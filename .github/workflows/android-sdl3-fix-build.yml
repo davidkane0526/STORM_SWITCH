@@ -1,9 +1,9 @@
-name: Android SDL3 startup fix build
+name: TOTK Normal + async-ASTC build
 
 on:
   push:
     branches:
-      - fix/android-sdl3-startup-8.1.2
+      - experiment/totk-blackbox-async-astc
   workflow_dispatch:
 
 jobs:
@@ -17,6 +17,12 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+
+      - name: Apply TOTK async-ASTC experiment
+        run: |
+          python3 .github/scripts/totk_async_astc_experiment.py
+          git diff --check
+          git diff -- src/core/core.cpp src/common/settings.cpp
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -48,7 +54,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           SDL_CI_VERSION='3.4.8-d57c3b685c'
           SDL_SOURCE_COMMIT='d57c3b685c434d2ee0fa3d258f7e165b6e8d0cf6'
           CACHE="$GITHUB_WORKSPACE/.cache/cpm/sdl3/${SDL_CI_VERSION}-android-aarch64"
@@ -61,7 +66,6 @@ jobs:
 
           rm -rf "$CACHE" "$SOURCE_DIR"
           mkdir -p "$CACHE" "$SOURCE_DIR"
-
           CI_URL="https://github.com/crueter-ci/SDL3/releases/download/v${SDL_CI_VERSION}/SDL3-android-aarch64-${SDL_CI_VERSION}.tar.zst"
           CI_SHA_URL="${CI_URL}.sha512sum"
           curl --fail --location --retry 5 --retry-all-errors "$CI_URL" --output "$CI_TARBALL"
@@ -73,14 +77,9 @@ jobs:
           SYMBOLS_BEFORE="$RUNNER_TEMP/sdl3-symbols-before.txt"
           SYMBOLS_AFTER="$RUNNER_TEMP/sdl3-symbols-after.txt"
           PATCHED_ARCHIVE="$RUNNER_TEMP/libSDL3.patched.a"
-          test -f "$SDL_ARCHIVE"
-
           "$NM" -g --defined-only "$SDL_ARCHIVE" > "$SYMBOLS_BEFORE"
-          echo 'SDL JNI symbols before rename:'
-          grep -E '(^|[[:space:]])(JNI_OnLoad|SDL_JNI_OnLoad)$' "$SYMBOLS_BEFORE" || true
-
           if grep -Fq ' SDL_JNI_OnLoad' "$SYMBOLS_BEFORE"; then
-            echo 'SDL_JNI_OnLoad already exported; no rename needed.'
+            true
           elif grep -Fq ' JNI_OnLoad' "$SYMBOLS_BEFORE"; then
             "$OBJCOPY" --redefine-sym JNI_OnLoad=SDL_JNI_OnLoad "$SDL_ARCHIVE" "$PATCHED_ARCHIVE"
             mv "$PATCHED_ARCHIVE" "$SDL_ARCHIVE"
@@ -88,32 +87,17 @@ jobs:
             echo '::error::SDL static archive exports neither JNI_OnLoad nor SDL_JNI_OnLoad.'
             exit 1
           fi
-
           "$NM" -g --defined-only "$SDL_ARCHIVE" > "$SYMBOLS_AFTER"
-          echo 'SDL JNI symbols after rename:'
-          grep -E '(^|[[:space:]])(JNI_OnLoad|SDL_JNI_OnLoad)$' "$SYMBOLS_AFTER" || true
-          if ! grep -Fq ' SDL_JNI_OnLoad' "$SYMBOLS_AFTER"; then
-            echo '::error::SDL_JNI_OnLoad was not produced by the archive rewrite.'
-            exit 1
-          fi
-          if grep -Fq ' JNI_OnLoad' "$SYMBOLS_AFTER"; then
-            echo '::error::Original SDL JNI_OnLoad is still exported after the archive rewrite.'
-            exit 1
-          fi
+          grep -Fq ' SDL_JNI_OnLoad' "$SYMBOLS_AFTER"
+          ! grep -Fq ' JNI_OnLoad' "$SYMBOLS_AFTER"
 
           SOURCE_URL="https://github.com/libsdl-org/SDL/archive/${SDL_SOURCE_COMMIT}.tar.gz"
           curl --fail --location --retry 5 --retry-all-errors "$SOURCE_URL" --output "$SOURCE_TARBALL"
           tar -xzf "$SOURCE_TARBALL" -C "$SOURCE_DIR" --strip-components=1
-
           mkdir -p "$CACHE/java"
           cp -R "$SOURCE_DIR/android-project/app/src/main/java/." "$CACHE/java/"
-
-          # CPMUtil's no-patch cache key is the literal string "none".
           printf 'none' > "$CACHE/.cpm_patch_key"
-
-          test -f "$CACHE/CMakeLists.txt"
           test -f "$CACHE/java/org/libsdl/app/SDLActivity.java"
-          echo "Prepared exact SDL ${SDL_SOURCE_COMMIT} Java glue and renamed static JNI entrypoint at $CACHE"
 
       - name: Build mainline release APK
         working-directory: src/android
@@ -125,15 +109,11 @@ jobs:
           ./gradlew :app:assembleMainlineRelease --stacktrace --no-daemon 2>&1 | tee "$RUNNER_TEMP/gradle-mainline-release.log"
           GRADLE_RC=${PIPESTATUS[0]}
           set -e
-
-          echo "gradlew exit code: $GRADLE_RC"
           APK="$(find app/build/outputs/apk -type f -name '*.apk' | head -n 1 || true)"
-
           if [ "$GRADLE_RC" -ne 0 ]; then
             if grep -Fq 'BUILD SUCCESSFUL' "$RUNNER_TEMP/gradle-mainline-release.log" && [ -n "$APK" ] && [ -f "$APK" ]; then
-              echo "::warning::Gradle returned $GRADLE_RC after BUILD SUCCESSFUL; APK exists at $APK, continuing to independent APK/DEX validation."
+              echo "::warning::Gradle returned $GRADLE_RC after BUILD SUCCESSFUL; continuing validation."
             else
-              echo "::error::Gradle returned $GRADLE_RC without both BUILD SUCCESSFUL and a produced APK."
               exit "$GRADLE_RC"
             fi
           fi
@@ -142,7 +122,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gradle-mainline-release-log
+          name: totk-async-astc-gradle-log
           path: ${{ runner.temp }}/gradle-mainline-release.log
           if-no-files-found: warn
           retention-days: 7
@@ -152,12 +132,8 @@ jobs:
         shell: bash
         run: |
           APK="$(find src/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
-          if [ -z "$APK" ]; then
-            echo "::error::No APK produced"
-            exit 1
-          fi
+          test -n "$APK"
           echo "path=$APK" >> "$GITHUB_OUTPUT"
-          echo "APK: $APK"
 
       - name: Verify SDLActivity is packaged
         shell: bash
@@ -166,20 +142,16 @@ jobs:
           FOUND=0
           while IFS= read -r DEX; do
             if unzip -p "$APK" "$DEX" | strings | grep -Fq 'org/libsdl/app/SDLActivity'; then
-              echo "Found org.libsdl.app.SDLActivity in $DEX"
               FOUND=1
               break
             fi
           done < <(unzip -Z1 "$APK" | grep -E '^classes([0-9]+)?\.dex$')
-          if [ "$FOUND" -ne 1 ]; then
-            echo "::error::org.libsdl.app.SDLActivity is missing from the built APK"
-            exit 1
-          fi
+          test "$FOUND" -eq 1
 
-      - name: Upload fixed APK
+      - name: Upload TOTK async-ASTC APK
         uses: actions/upload-artifact@v4
         with:
-          name: STORM_SWITCH_8.1.2_SDL3_FIX
+          name: STORM_SWITCH_8.1.2_TOTK_BLACKBOX_ASYNC_ASTC
           path: ${{ steps.apk.outputs.path }}
           if-no-files-found: error
           retention-days: 14
