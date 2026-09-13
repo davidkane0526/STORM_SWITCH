@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/android-sdl3-startup-8.1.2
+      - test/totk-blackblock-minimal
   workflow_dispatch:
 
 jobs:
@@ -17,6 +18,56 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+
+      - name: Disable TOTK GameFix profile for black-block A/B test
+        if: github.ref == 'refs/heads/test/totk-blackblock-minimal'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          core = Path('src/core/core.cpp')
+          text = core.read_text()
+          old = '''        if (params.program_id != 0) {
+              Settings::SetCurrentProgramID(params.program_id);
+              if (Core::GameFixDatabase::AreFixesEnabled()) {
+                  Core::GameFixDatabase::ApplyProfileDirectly(params.program_id);
+              }
+          }'''
+          if old not in text:
+              old = '''        if (params.program_id != 0) {
+              Settings::SetCurrentProgramID(params.program_id);
+              Core::GameFixDatabase::ApplyProfileDirectly(params.program_id);
+          }'''
+          if old not in text:
+              raise SystemExit('core.cpp GameFix block not found')
+          new = old.replace(
+              'if (Core::GameFixDatabase::AreFixesEnabled()) {',
+              'if (params.program_id != 0x0100F2C0115B6000ULL && Core::GameFixDatabase::AreFixesEnabled()) {'
+          )
+          if new == old:
+              new = old.replace(
+                  'Core::GameFixDatabase::ApplyProfileDirectly(params.program_id);',
+                  'if (params.program_id != 0x0100F2C0115B6000ULL) {\n                  Core::GameFixDatabase::ApplyProfileDirectly(params.program_id);\n              }'
+              )
+          core.write_text(text.replace(old, new, 1))
+
+          android_db = Path('src/android/app/src/main/java/org/yuzu/yuzu_emu/model/GameFixDatabase.kt')
+          text = android_db.read_text()
+          old = '''    fun hasFix(game: Game): Boolean {
+              return getFix(game) != null
+          }'''
+          if old not in text:
+              raise SystemExit('Android hasFix(game) block not found')
+          new = '''    fun hasFix(game: Game): Boolean {
+              if (getProgramIdHex(game).equals("0100F2C0115B6000", ignoreCase = true)) return false
+              return getFix(game) != null
+          }'''
+          android_db.write_text(text.replace(old, new, 1))
+          PY
+
+          grep -n -A4 -B2 '0100F2C0115B6000ULL' src/core/core.cpp
+          grep -n -A4 -B2 '0100F2C0115B6000' src/android/app/src/main/java/org/yuzu/yuzu_emu/model/GameFixDatabase.kt | tail -n 12
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -179,7 +230,7 @@ jobs:
       - name: Upload fixed APK
         uses: actions/upload-artifact@v4
         with:
-          name: STORM_SWITCH_8.1.2_SDL3_FIX
+          name: ${{ github.ref_name == 'test/totk-blackblock-minimal' && 'STORM_SWITCH_8.1.2_TOTK_BLACKBLOCK_MINIMAL' || 'STORM_SWITCH_8.1.2_SDL3_FIX' }}
           path: ${{ steps.apk.outputs.path }}
           if-no-files-found: error
           retention-days: 14
